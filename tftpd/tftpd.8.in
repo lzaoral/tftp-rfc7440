@@ -231,6 +231,11 @@ Set the time before the server retransmits a packet, in microseconds.
 \fBrollover\fP (nonstandard)
 Set the block number to resume at after a block number rollover.  The
 default and recommended value is zero.
+.TP
+\fBwindowsize\fP (RFC 7440)
+Set the windowsize to a number of blocks that should be sent before
+expecting an ack. The default is 1, which means the same functionality
+as if windowsize wasn't used. Maximum is 64.
 .PP
 The
 .B \-\-refuse
@@ -442,6 +447,9 @@ RFC 2348,
 .br
 RFC 2349,
 .IR "TFTP Timeout Interval and Transfer Size Options" .
+.br
+RFC 7440,
+.IR "TFTP Windowsize Option" .
 .SH "AUTHOR"
 This version of
 .B tftpd

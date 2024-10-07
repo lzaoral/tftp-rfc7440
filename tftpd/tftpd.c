@@ -90,6 +90,9 @@ static char buf[PKTSIZE];
 static char ackbuf[PKTSIZE];
 static unsigned int max_blksize = MAX_SEGSIZE;
 
+#define MAX_WINDOWSIZE 64
+static int windowsize = 1;
+
 static char tmpbuf[INET6_ADDRSTRLEN], *tmp_p;
 
 static union sock_addr from;
@@ -123,6 +126,7 @@ static int set_tsize(uintmax_t *);
 static int set_timeout(uintmax_t *);
 static int set_utimeout(uintmax_t *);
 static int set_rollover(uintmax_t *);
+static int set_windowsize(uintmax_t *);
 
 struct options {
     const char *o_opt;
@@ -134,6 +138,7 @@ struct options {
     {"timeout",  set_timeout},
     {"utimeout", set_utimeout},
     {"rollover", set_rollover},
+    {"windowsize", set_windowsize},
     {NULL, NULL}
 };
 
@@ -1320,6 +1325,18 @@ static int set_utimeout(uintmax_t *vp)
 }
 
 /*
+ * Set window size (c.f. RFC7440)
+ */
+static int set_windowsize(uintmax_t *vp)
+{
+    if (*vp < 1 || *vp > MAX_WINDOWSIZE)
+        return 0;
+    windowsize = *vp;
+
+    return 1;
+}
+
+/*
  * Conservative calculation for the size of a buffer which can hold an
  * arbitrary integer
  */
@@ -1586,7 +1603,8 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
     static u_short block = 1;   /* Static to avoid longjmp funnies */
     u_short ap_opcode, ap_block;
     unsigned long r_timeout;
-    int size, n;
+    int size, n, window;
+    off_t offset = 0;
 
     if (oap) {
         timeout = rexmtval;
@@ -1623,6 +1641,8 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
     }
 
     dp = r_init();
+    timeout = rexmtval;
+    window = 0;
     do {
         size = readit(file, &dp, pf->f_convert);
         if (size < 0) {
@@ -1631,16 +1651,28 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
         }
         dp->th_opcode = htons((u_short) DATA);
         dp->th_block = htons((u_short) block);
-        timeout = rexmtval;
-        (void)sigsetjmp(timeoutbuf, 1);
+
+        offset -= size;
+        window++;
+
+        if (sigsetjmp(timeoutbuf, 1) != 0) {
+            lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+            block -= (window - 1);
+            window = offset = 0;
+            dp = r_init();
+            continue;
+        }
 
         r_timeout = timeout;
         if (send(peer, dp, size + 4, 0) != size + 4) {
             syslog(LOG_WARNING, "tftpd: write: %m");
             goto abort;
         }
-        read_ahead(file, pf->f_convert);
-        for (;;) {
+
+        // TODO: make this useful
+        // read_ahead(file, pf->f_convert);
+
+        while (window == windowsize || size != segsize) {
             n = recv_time(peer, ackbuf, sizeof(ackbuf), 0, &r_timeout);
             if (n < 0) {
                 syslog(LOG_WARNING, "tftpd: read(ack): %m");
@@ -1654,16 +1686,35 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
                 goto abort;
 
             if (ap_opcode == ACK) {
+                /* Whole window sent */
                 if (ap_block == block) {
+                    offset = window = 0;
+                    timeout = rexmtval;
                     break;
                 }
+
+                /* TODO: overflow */
+                if (ap_block < block && block - ap_block < windowsize) {
+                    // TODO: check for last block
+                    int sent = (windowsize - (block - ap_block));
+                    offset += sent * segsize;
+                    lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+
+                    dp = r_init();
+                    block -= window - sent;
+                    offset = window = 0;
+                    timeout = rexmtval;
+                    break;
+                }
+
                 /* Re-synchronize with the other side */
                 (void)synchnet(peer);
-                /*
-                 * RFC1129/RFC1350: We MUST NOT re-send the DATA
-                 * packet in response to an invalid ACK.  Doing so
-                 * would cause the Sorcerer's Apprentice bug.
-                 */
+
+                lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+                dp = r_init();
+                block -= window;
+                window = offset = 0;
+                break;
             }
 
         }
@@ -1685,7 +1736,7 @@ static void tftp_recvfile(const struct formats *pf,
     /* These are "static" to avoid longjmp funnies */
     static struct tftphdr *oap;
     static struct tftphdr *ap;  /* ack buffer */
-    static u_short block = 0;
+    static u_short block = 0, window = 0;
     static int acksize;
     u_short dp_opcode, dp_block;
     unsigned long r_timeout;
@@ -1714,9 +1765,12 @@ static void tftp_recvfile(const struct formats *pf,
         (void)sigsetjmp(timeoutbuf, 1);
       send_ack:
         r_timeout = timeout;
-        if (send(peer, ackbuf, acksize, 0) != acksize) {
-            syslog(LOG_WARNING, "tftpd: write(ack): %m");
-            goto abort;
+        if (window == windowsize || size != segsize || oap) {
+            if (send(peer, ackbuf, acksize, 0) != acksize) {
+                syslog(LOG_WARNING, "tftpd: write(ack): %m");
+                goto abort;
+            }
+            window = 0;
         }
         write_behind(file, pf->f_convert);
         for (;;) {
@@ -1731,12 +1785,14 @@ static void tftp_recvfile(const struct formats *pf,
                 goto abort;
             if (dp_opcode == DATA) {
                 if (dp_block == block) {
+                    window++;
                     break;      /* normal */
                 }
+
                 /* Re-synchronize with the other side */
                 (void)synchnet(peer);
-                if (dp_block == (block - 1))
-                    goto send_ack;      /* rexmit */
+                window = windowsize; /* simulate whole window */
+                goto send_ack;       /* rexmit */
             }
         }
         /*  size = write(file, dp->th_data, n - 4); */
