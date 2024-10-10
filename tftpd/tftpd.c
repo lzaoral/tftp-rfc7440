@@ -1656,7 +1656,10 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
         window++;
 
         if (sigsetjmp(timeoutbuf, 1) != 0) {
-            lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+            if (lseek(fileno(file), offset, SEEK_CUR) < 0) {
+                syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                goto abort;
+            }
             block -= (window - 1);
             window = offset = 0;
             dp = r_init();
@@ -1693,15 +1696,26 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
                     break;
                 }
 
-                /* TODO: overflow */
-                if (ap_block < block && block - ap_block < windowsize) {
-                    // TODO: check for last block
-                    int sent = (windowsize - (block - ap_block));
-                    offset += sent * segsize;
-                    lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+                if ((ap_block < block && block - ap_block < windowsize) ||
+                    (ap_block > block && (block + 65535) - ap_block < windowsize)) {
+                    /* The offset is moved forward only by multiples of segsize */
+                    int acked = 0;
+
+                    /* No-rollover */
+                    if (block - ap_block < block)
+                        acked = windowsize - (block - ap_block);
+                    /* Roll-over */
+                    else
+                        acked = windowsize - ((block + 65535) - ap_block);
+
+                    offset += acked * segsize;
+                    if (lseek(fileno(file), offset, SEEK_CUR) < 0) {
+                        syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                        goto abort;
+                    }
 
                     dp = r_init();
-                    block -= window - sent;
+                    block -= window - acked;
                     offset = window = 0;
                     timeout = rexmtval;
                     break;
@@ -1710,7 +1724,10 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
                 /* Re-synchronize with the other side */
                 (void)synchnet(peer);
 
-                lseek(fileno(file), offset, SEEK_CUR); // TODO: check success
+                if (lseek(fileno(file), offset, SEEK_CUR) < 0) {
+                    syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                    goto abort;
+                }
                 dp = r_init();
                 block -= window;
                 window = offset = 0;
