@@ -195,9 +195,11 @@ static inline void usage(int errcode)
 {
     fprintf(stderr,
 #ifdef HAVE_IPV6
-            "Usage: %s [-4][-6][-v][-l][-m mode] [host [port]] [-c command]\n",
+            "Usage: %s [-4][-6][-v][-V][-l][-m mode] [-R port:port] "
+			"[host [port]] [-c command]\n",
 #else
-            "Usage: %s [-v][-l][-m mode] [host [port]] [-c command]\n",
+            "Usage: %s [-v][-V][-l][-m mode] [-R port:port] "
+			"[host [port]] [-c command]\n",
 #endif
             program);
     exit(errcode);
