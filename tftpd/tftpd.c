@@ -33,6 +33,34 @@
  * SUCH DAMAGE.
  */
 
+/* The RFC 7440 implementation is based on the original patch by Jan Synáček
+ * and the send/receive logic is based on the respective patches from the
+ * FreeBSD project licensed under the BSD-2-Clause-FreeBSD license below.
+ *
+ * Copyright (C) 2008 Edwin Groothuis. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
 #include "config.h"             /* Must be included first */
 #include "tftpd.h"
 
@@ -90,6 +118,9 @@ static char buf[PKTSIZE];
 static char ackbuf[PKTSIZE];
 static unsigned int max_blksize = MAX_SEGSIZE;
 
+#define MAX_WINDOWSIZE 64
+static int windowsize = 1;
+
 static char tmpbuf[INET6_ADDRSTRLEN], *tmp_p;
 
 static union sock_addr from;
@@ -123,6 +154,7 @@ static int set_tsize(uintmax_t *);
 static int set_timeout(uintmax_t *);
 static int set_utimeout(uintmax_t *);
 static int set_rollover(uintmax_t *);
+static int set_windowsize(uintmax_t *);
 
 struct options {
     const char *o_opt;
@@ -134,6 +166,7 @@ struct options {
     {"timeout",  set_timeout},
     {"utimeout", set_utimeout},
     {"rollover", set_rollover},
+    {"windowsize", set_windowsize},
     {NULL, NULL}
 };
 
@@ -1315,6 +1348,18 @@ static int set_utimeout(uintmax_t *vp)
 }
 
 /*
+ * Set window size (c.f. RFC7440)
+ */
+static int set_windowsize(uintmax_t *vp)
+{
+    if (*vp < 1 || *vp > MAX_WINDOWSIZE)
+        return 0;
+    windowsize = *vp;
+
+    return 1;
+}
+
+/*
  * Conservative calculation for the size of a buffer which can hold an
  * arbitrary integer
  */
@@ -1573,6 +1618,23 @@ static int validate_access(char *filename, int mode,
     return (0);
 }
 
+struct tile {
+    off_t offset;
+    uint16_t block;
+};
+
+static off_t tell(int convert)
+{
+    return convert ? ftello(file)
+                   : lseek(fileno(file), 0, SEEK_CUR);
+}
+
+static off_t seek(off_t offset, int convert)
+{
+    return convert ? fseeko(file, offset, SEEK_SET)
+                   : lseek(fileno(file), offset, SEEK_SET);
+}
+
 /*
  * Send the requested file.
  */
@@ -1580,10 +1642,11 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
 {
     struct tftphdr *dp;
     struct tftphdr *ap;         /* ack packet */
-    static u_short block = 1;   /* Static to avoid longjmp funnies */
+    static u_short block = 1, window_block;   /* Static to avoid longjmp funnies */
     u_short ap_opcode, ap_block;
     unsigned long r_timeout;
-    int size, n;
+    int size, n, i;
+    struct tile window[MAX_WINDOWSIZE];
 
     if (oap) {
         timeout = rexmtval;
@@ -1620,7 +1683,14 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
     }
 
     dp = r_init();
+    timeout = rexmtval;
+    window_block = 0;
     do {
+read_block:
+        window[window_block].offset = tell(pf->f_convert);
+        window[window_block].block = block;
+        window_block++;
+
         size = readit(file, &dp, pf->f_convert);
         if (size < 0) {
             nak(errno + 100, NULL);
@@ -1628,16 +1698,27 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
         }
         dp->th_opcode = htons((u_short) DATA);
         dp->th_block = htons((u_short) block);
-        timeout = rexmtval;
-        (void)sigsetjmp(timeoutbuf, 1);
+
+        // ack timeout
+        if (sigsetjmp(timeoutbuf, 1) != 0 ) {
+            if (seek(window[0].offset, pf->f_convert) < 0) {;
+                syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                goto abort;
+            }
+            block = window[0].block;
+            window_block = 0;
+
+            dp = r_init();
+            goto read_block;
+        }
 
         r_timeout = timeout;
         if (send(peer, dp, size + 4, 0) != size + 4) {
             syslog(LOG_WARNING, "tftpd: write: %m");
             goto abort;
         }
-        read_ahead(file, pf->f_convert);
-        for (;;) {
+
+        if (window_block == windowsize || size != segsize) {
             n = recv_time(peer, ackbuf, sizeof(ackbuf), 0, &r_timeout);
             if (n < 0) {
                 syslog(LOG_WARNING, "tftpd: read(ack): %m");
@@ -1651,21 +1732,50 @@ static void tftp_sendfile(const struct formats *pf, struct tftphdr *oap, int oac
                 goto abort;
 
             if (ap_opcode == ACK) {
-                if (ap_block == block) {
-                    break;
+                for (i = 0; i < window_block; i++) {
+                    if (ap_block == window[i].block)
+                        break;
                 }
-                /* Re-synchronize with the other side */
-                (void)synchnet(peer);
-                /*
-                 * RFC1129/RFC1350: We MUST NOT re-send the DATA
-                 * packet in response to an invalid ACK.  Doing so
-                 * would cause the Sorcerer's Apprentice bug.
-                 */
+
+                /* Unexpected ACK */
+                if (i == window_block) {
+                    /* Re-synchronize with the other side */
+                    (void)synchnet(peer);
+
+                    if (seek(window[0].offset, pf->f_convert) < 0) {;
+                        syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                        goto abort;
+                    }
+                    block = window[0].block;
+                    window_block = 0;
+
+                    dp = r_init();
+                    goto read_block;
+                }
+
+                /* ACKed at least some data. */
+                timeout = rexmtval;
+
+                /* Partial ACK. */
+                if (i + 1 != window_block) {
+                    if (seek(window[i + 1].offset, pf->f_convert) < 0) {;
+                        syslog(LOG_WARNING, "tftpd: read(ack): %m");
+                        goto abort;
+                    }
+                    block = window[i + 1].block;
+                    window_block = 0;
+
+                    dp = r_init();
+                    goto read_block;
+                }
+
+                window_block = 0;
             }
 
         }
 	if (!++block)
 	  block = rollover_val;
+
     } while (size == segsize);
     tmp_p = (char *)inet_ntop(from.sa.sa_family, SOCKADDR_P(&from),
                                           tmpbuf, INET6_ADDRSTRLEN);
@@ -1687,7 +1797,7 @@ static void tftp_recvfile(const struct formats *pf, struct tftphdr *oap, int oac
     int n, size;
     /* These are "static" to avoid longjmp funnies */
     static struct tftphdr *ap;  /* ack buffer */
-    static u_short block = 0;
+    static u_short block = 0, window_block = 0, window_start = 0, acked_block = 0, oldblock = 0;
     static int acksize;
     u_short dp_opcode, dp_block;
     unsigned long r_timeout;
@@ -1708,15 +1818,31 @@ static void tftp_recvfile(const struct formats *pf, struct tftphdr *oap, int oac
              * sent the OACK. Clear oap so that we won't try to send another
              * OACK when the block number wraps back to 0. */
             oap = NULL;
+
+            window_block++;
         }
+
+        oldblock = block;
         if (!++block)
 	  block = rollover_val;
-        (void)sigsetjmp(timeoutbuf, 1);
-      send_ack:
-        r_timeout = timeout;
-        if (send(peer, ackbuf, acksize, 0) != acksize) {
-            syslog(LOG_WARNING, "tftpd: write(ack): %m");
-            goto abort;
+
+        if (sigsetjmp(timeoutbuf, 1) != 0) {
+            /* Send ACK for last received block on timeout. */
+            goto send_ack;
+        }
+
+        /* By default, send ACK only if it's OACK or the window is full.
+         * Explicit ACK can be requested on timeouts, or out-of-order DATA packets */
+        if (oap || window_block >= windowsize) {
+          send_ack:
+            r_timeout = timeout;
+            if (send(peer, ackbuf, acksize, 0) != acksize) {
+                syslog(LOG_WARNING, "tftpd: write(ack): %m");
+                goto abort;
+            }
+
+            acked_block = oldblock;
+            window_block = 0;
         }
         write_behind(file, pf->f_convert);
         for (;;) {
@@ -1731,12 +1857,37 @@ static void tftp_recvfile(const struct formats *pf, struct tftphdr *oap, int oac
                 goto abort;
             if (dp_opcode == DATA) {
                 if (dp_block == block) {
+                    r_timeout = timeout;
                     break;      /* normal */
                 }
+
+                /*
+                 * Ignore duplicate blocks within the
+                 * window.
+                 *
+                 * This does not handle duplicate
+                 * blocks during a rollover as
+                 * gracefully, but that should still
+                 * recover eventually.
+                 */
+                if (block > windowsize)
+                    window_start = block - windowsize;
+                else
+                    window_start = 0;
+
+                if (dp_block > window_start && dp_block < block) {
+                    r_timeout = timeout;
+                    window_block++;
+                    continue;
+                }
+
+                /* Do not send duplicated ACKs for the rest of the incomplete window */
+                if (acked_block == oldblock)
+                    continue;
+
                 /* Re-synchronize with the other side */
                 (void)synchnet(peer);
-                if (dp_block == (block - 1))
-                    goto send_ack;      /* rexmit */
+                goto send_ack;      /* rexmit */
             }
         }
         /*  size = write(file, dp->th_data, n - 4); */
@@ -1756,14 +1907,16 @@ static void tftp_recvfile(const struct formats *pf, struct tftphdr *oap, int oac
     ap->th_block = htons((u_short) (block));
     (void)send(peer, ackbuf, 4, 0);
 
-    timeout_quit = 1;           /* just quit on timeout */
-    n = recv_time(peer, buf, sizeof(buf), 0, &timeout); /* normally times out and quits */
-    timeout_quit = 0;
-
-    if (n >= 4 &&               /* if read some data */
-        dp_opcode == DATA &&    /* and got a data block */
-        block == dp_block) {    /* then my last ack was lost */
-        (void)send(peer, ackbuf, 4, 0); /* resend final ack */
+    /* Last ack can get lost, let's try and resend it twice to make it more
+     * likely that the ack gets to the sender.
+     *
+     * The original code broke when the ack was lost and the sender reached
+     * timeout because the receiver would exit and the sender would never get
+     * the final ack.
+     */
+    for (n = 0; n < 2; ++n) {
+        usleep(rexmtval);
+        (void)send(peer, ackbuf, 4, 0);
     }
   abort:
     return;
