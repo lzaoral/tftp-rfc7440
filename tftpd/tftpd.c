@@ -1388,24 +1388,25 @@ static int rewrite_macros(char macro, char *output)
             return strlen(p);
 
     case 'x':
-        if (output) {
-            if (from.sa.sa_family == AF_INET) {
+        if (from.sa.sa_family == AF_INET) {
+            if (output) {
                 sprintf(output, "%08lX",
                     (unsigned long)ntohl(from.si.sin_addr.s_addr));
-                l = 8;
-#ifdef HAVE_IPV6
-            } else {
-                unsigned char *c = (unsigned char *)SOCKADDR_P(&from);
-                p = tb;
-                for (l = 0; l < 16; l++) {
-                    sprintf(p, "%02X", *c);
-                    c++;
-                    p += 2;
-                }
-                strcpy(output, tb);
-                l = strlen(tb);
-#endif
             }
+            l = 8;
+#ifdef HAVE_IPV6
+        } else {
+            unsigned char *c = (unsigned char *)SOCKADDR_P(&from);
+            p = tb;
+            for (l = 0; l < 16; l++) {
+                sprintf(p, "%02X", *c);
+                c++;
+                p += 2;
+            }
+            if (output)
+                strcpy(output, tb);
+            l = strlen(tb);
+#endif
         }
         return l;
 
