@@ -631,6 +631,13 @@ int main(int argc, char **argv)
                         exit(EX_USAGE);
                     }
                     ai_fam = AF_INET6;
+
+                    if (fd6 < 0) {
+                        syslog(LOG_ERR,
+                               "IPv6 was disabled but address %s is in address "
+                               "family AF_INET6", address);
+                        exit(EX_USAGE);
+                    }
                 }
                 break;
 #endif
@@ -778,7 +785,7 @@ int main(int argc, char **argv)
     }
 
     /* Disable path MTU discovery */
-    pmtu_discovery_off(fd);
+    pmtu_discovery_off(fdmax);
 
     /* This means we don't want to wait() for children */
 #ifdef SA_NOCLDWAIT
@@ -1527,6 +1534,7 @@ static int validate_access(char *filename, int mode,
 
     if (mode == RRQ) {
         if (!unixperms && (stbuf.st_mode & (S_IREAD >> 6)) == 0) {
+            close(fd);
             *errmsg = "File must have global read permissions";
             return (EACCESS);
         }
@@ -1536,6 +1544,7 @@ static int validate_access(char *filename, int mode,
     } else {
         if (!unixperms) {
             if ((stbuf.st_mode & (S_IWRITE >> 6)) == 0) {
+                close(fd);
                 *errmsg = "File must have global write permissions";
                 return (EACCESS);
             }
@@ -1544,6 +1553,7 @@ static int validate_access(char *filename, int mode,
 #ifdef HAVE_FTRUNCATE
 	/* We didn't get to truncate the file at open() time */
 	if (ftruncate(fd, (off_t) 0)) {
+	  close(fd);
 	  *errmsg = "Cannot reset file size";
 	  return (EACCESS);
 	}
