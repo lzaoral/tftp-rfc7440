@@ -85,7 +85,7 @@ void tftp_sendfile(int fd, const char *name, const char *mode)
     is_request = 1;             /* First packet is the actual WRQ */
     amount = 0;
 
-    bsd_signal(SIGALRM, timer);
+    signal(SIGALRM, timer);
     do {
         if (is_request) {
             size = makerequest(WRQ, name, dp, mode) - 4;
@@ -191,7 +191,7 @@ void tftp_recvfile(int fd, const char *name, const char *mode)
     firsttrip = 1;
     amount = 0;
 
-    bsd_signal(SIGALRM, timer);
+    signal(SIGALRM, timer);
     do {
         if (firsttrip) {
             size = makerequest(RRQ, name, ap, mode);

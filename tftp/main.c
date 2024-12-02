@@ -310,7 +310,7 @@ int main(int argc, char *argv[])
         sp->s_proto = (char *)"udp";
     }
 
-    bsd_signal(SIGINT, intr);
+    signal(SIGINT, intr);
 
     if (peerargc) {
         /* Set peer */
@@ -791,7 +791,7 @@ void intr(int sig)
 {
     (void)sig;                  /* Quiet unused warning */
 
-    bsd_signal(SIGALRM, SIG_IGN);
+    signal(SIGALRM, SIG_IGN);
     alarm(0);
     siglongjmp(toplevel, -1);
 }
