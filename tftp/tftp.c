@@ -279,15 +279,16 @@ makerequest(int request, const char *name,
             struct tftphdr *tp, const char *mode)
 {
     char *cp;
+    size_t len;
 
     tp->th_opcode = htons((u_short) request);
     cp = (char *)&(tp->th_stuff);
-    strcpy(cp, name);
-    cp += strlen(name);
-    *cp++ = '\0';
-    strcpy(cp, mode);
-    cp += strlen(mode);
-    *cp++ = '\0';
+    len = strlen(name) + 1;
+    memcpy(cp, name, len);
+    cp += len;
+    len = strlen(mode) + 1;
+    memcpy(cp, mode, len);
+    cp += len;
     return (cp - (char *)tp);
 }
 
