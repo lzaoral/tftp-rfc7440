@@ -89,11 +89,14 @@ int connected;
 const struct modes *mode;
 #ifdef WITH_READLINE
 char *line = NULL;
+char *remote_pth = NULL;
 #else
 char line[LBUFLEN];
+char remote_pth[LBUFLEN];
 #endif
 int margc;
-char *margv[20];
+char **margv;
+int sizeof_margv=0;
 const char *prompt = "tftp> ";
 sigjmp_buf toplevel;
 void intr(int);
@@ -379,6 +382,10 @@ static void getmoreargs(const char *partial, const char *mprompt)
         free(line);
         line = NULL;
     }
+    if (remote_pth) {
+        free(remote_pth);
+        remote_pth = NULL;
+    }
     line = xmalloc(len + elen + 1);
     strcpy(line, partial);
     strcpy(line + len, eline);
@@ -535,6 +542,7 @@ void put(int argc, char *argv[])
     int fd;
     int n, err;
     char *cp, *targ;
+    long dirlen, namelen, lastlen=0;
 
     if (argc < 2) {
         getmoreargs("send ", "(file) ");
@@ -588,9 +596,22 @@ void put(int argc, char *argv[])
     }
     /* this assumes the target is a directory */
     /* on a remote unix system.  hmmmm.  */
-    cp = strchr(targ, '\0');
-    *cp++ = '/';
+    dirlen = strlen(targ)+1;
+#ifdef WITH_READLINE
+    remote_pth = xmalloc(dirlen+1);
+#endif
+    strcpy(remote_pth, targ);
+    remote_pth[dirlen-1] = '/';
+    cp = remote_pth + dirlen;
     for (n = 1; n < argc - 1; n++) {
+#ifdef WITH_READLINE
+        namelen = strlen(tail(argv[n])) + 1;
+        if (namelen > lastlen) {
+            remote_pth = xrealloc(remote_pth, dirlen + namelen + 1);
+            cp = remote_pth + dirlen;
+            lastlen = namelen;
+        }
+#endif
         strcpy(cp, tail(argv[n]));
         fd = open(argv[n], O_RDONLY | mode->m_openflags);
         if (fd < 0) {
@@ -600,9 +621,9 @@ void put(int argc, char *argv[])
         }
         if (verbose)
             printf("putting %s to %s:%s [%s]\n",
-                   argv[n], hostname, targ, mode->m_mode);
+                   argv[n], hostname, remote_pth, mode->m_mode);
         sa_set_port(&peeraddr, port);
-        tftp_sendfile(fd, targ, mode->m_mode);
+        tftp_sendfile(fd, remote_pth, mode->m_mode);
     }
 }
 
@@ -801,6 +822,10 @@ static void command(void)
             free(line);
             line = NULL;
         }
+        if (remote_pth) {
+            free(remote_pth);
+            remote_pth = NULL;
+        }
         line = readline(prompt);
         if (!line)
             exit(0);            /* EOF */
@@ -872,7 +897,13 @@ struct cmd *getcmd(char *name)
 static void makeargv(void)
 {
     char *cp;
-    char **argp = margv;
+    char **argp;
+
+    if (!sizeof_margv) {
+        sizeof_margv = 20;
+        margv = xmalloc(sizeof_margv * sizeof(char *));
+    }
+    argp = margv;
 
     margc = 0;
     for (cp = line; *cp;) {
@@ -882,6 +913,11 @@ static void makeargv(void)
             break;
         *argp++ = cp;
         margc += 1;
+        if (margc == sizeof_margv) {
+            sizeof_margv += 20;
+            margv = xrealloc(margv, sizeof_margv * sizeof(char *));
+            argp = margv + margc;
+        }
         while (*cp != '\0' && !isspace(*cp))
             cp++;
         if (*cp == '\0')
